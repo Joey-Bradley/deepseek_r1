@@ -20,11 +20,11 @@ client = OpenAI(
 
 
 # Initialize the client with DeepSeek's specific base URL
-
-stream = client.chat.completions.create(
+try:
+  stream = client.chat.completions.create(
     model="deepseek-reasoner",
     messages=[
-        {"role": "user", "content": "Explain quantum computing in simple terms?"},
+        {"role": "user", "content": "Explain obd code 0430?"},
         #{"role": "user", "content": "Hello"},
     ],
     
@@ -34,6 +34,14 @@ stream = client.chat.completions.create(
     #reasoning_effort="high",
     #extra_body={"thinking": {"type": "enabled"}}
 )
+  
+except AuthenticationError:
+  print("Authentication Failed - check api key")
+except APIError as e:
+  print("API Error: {e}")
+except Exception as e:
+  print("Unexpected Error: {e}")
+
 
 if stream:
   print("Response")
@@ -41,3 +49,4 @@ if stream:
     if chunk.choices[0].delta.content:
       print(chunk.choices[0].delta.content,
             end="", flush=True)
+      
