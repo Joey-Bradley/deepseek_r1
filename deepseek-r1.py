@@ -1,19 +1,24 @@
 import os
-from openai import OpenAI, APIError, AutheticationError
+from dotenv import load_dotenv
+from openai import OpenAI, APIError, AuthenticationError
 
-client = OpenAI(
-    api_key=os.environ.get('DEEPSEEK_API_KEY'),
-    base_url="https://api.deepseek.com")
+# Load variables from .env
+load_dotenv()
+
+# Access the key
+api_key = os.getenv("OPENAI_API_KEY")
+
+client = OpenAI()
 
 response = client.chat.completions.create(
-    model="deepseek-v4-pro",
+    model="deepseek-reasoner",
     messages=[
-        {"role": "system", "content": "You are a helpful assistant"},
-        {"role": "user", "content": "Hello"},
+        {"role": "user", "content": "Explain quantum computing in simple terms"},
+        #{"role": "user", "content": "Hello"},
     ],
     #stream=False,
     temperature= 0.7,
-    max_tokens=100,
+    max_tokens=1000,
     #reasoning_effort="high",
     #extra_body={"thinking": {"type": "enabled"}}
 )
