@@ -5,6 +5,10 @@ services:
     plan: starter
     buildCommand: pip install -r requirements.txt
     startCommand: streamlit run app.py --server.port $PORT --server.address 0.0.0.0
+    disk:
+      name: ledger-data
+      mountPath: /var/data
+      sizeGB: 1
     envVars:
       - key: DEEPSEEK_API_KEY
         sync: false
@@ -20,3 +24,5 @@ services:
         sync: false
       - key: ACCESS_CODE
         sync: false
+      - key: LEDGER_DB_PATH
+        value: /var/data/ledger.db

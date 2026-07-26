@@ -12,6 +12,7 @@ from email.mime.application import MIMEApplication
 from datetime import datetime
 import re
 import time
+import sqlite3
 
 # ─── Configuration ────────────────────────────────
 load_dotenv()
@@ -51,6 +52,12 @@ try:
 except Exception:
     ACCESS_CODE = os.getenv("ACCESS_CODE")
 
+# Maintenance ledger DB path. On Render this should point at a mounted
+# persistent disk (see render.yaml) so entries survive deploys/restarts.
+# Falls back to a local file automatically if that path isn't writable
+# (e.g. running locally without the disk attached).
+LEDGER_DB_PATH = os.getenv("LEDGER_DB_PATH", "/var/data/ledger.db")
+
 # ─── Session State ────────────────────────────────
 if "output_text" not in st.session_state:
     st.session_state.output_text = None
@@ -62,6 +69,10 @@ if "request_count" not in st.session_state:
     st.session_state.request_count = 0
 if "last_request_time" not in st.session_state:
     st.session_state.last_request_time = 0.0
+if "ledger_entries" not in st.session_state:
+    st.session_state.ledger_entries = None
+if "ledger_last_lookup" not in st.session_state:
+    st.session_state.ledger_last_lookup = None
 
 # Apply any VIN-decoded values before the widgets below are instantiated.
 # (A widget's session_state key can't be written after that widget has
@@ -98,6 +109,101 @@ def decode_vin(vin):
     except Exception:
         return None
 
+# ─── MAINTENANCE LEDGER (SQLite) ─────────────────
+def _ledger_db_path():
+    """Return a usable path for the SQLite ledger DB, falling back to a
+    local file if the configured (persistent-disk) path isn't writable —
+    e.g. when running locally without the Render disk mounted."""
+    configured_dir = os.path.dirname(LEDGER_DB_PATH) or "."
+    try:
+        os.makedirs(configured_dir, exist_ok=True)
+        test_path = os.path.join(configured_dir, ".write_test")
+        with open(test_path, "w") as f:
+            f.write("ok")
+        os.remove(test_path)
+        return LEDGER_DB_PATH
+    except Exception:
+        return "ledger_local.db"
+
+
+@st.cache_resource
+def get_db_connection():
+    conn = sqlite3.connect(_ledger_db_path(), check_same_thread=False)
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS ledger_entries (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            email TEXT NOT NULL,
+            vehicle TEXT,
+            code TEXT,
+            service_date TEXT,
+            mileage INTEGER,
+            fix_performed TEXT,
+            cost REAL,
+            notes TEXT,
+            created_at TEXT NOT NULL
+        )
+        """
+    )
+    conn.commit()
+    return conn
+
+
+def add_ledger_entry(email, vehicle, code, service_date, mileage, fix_performed, cost, notes):
+    conn = get_db_connection()
+    conn.execute(
+        """INSERT INTO ledger_entries
+           (email, vehicle, code, service_date, mileage, fix_performed, cost, notes, created_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+        (
+            email.strip().lower(),
+            (vehicle or "").strip(),
+            (code or "").strip(),
+            service_date,
+            int(mileage) if mileage else None,
+            (fix_performed or "").strip(),
+            float(cost) if cost else None,
+            (notes or "").strip(),
+            datetime.now().isoformat(timespec="seconds"),
+        ),
+    )
+    conn.commit()
+
+
+def get_ledger_entries(email):
+    conn = get_db_connection()
+    cur = conn.execute(
+        """SELECT service_date, vehicle, code, mileage, fix_performed, cost, notes
+           FROM ledger_entries
+           WHERE email = ?
+           ORDER BY service_date DESC, id DESC""",
+        (email.strip().lower(),),
+    )
+    rows = cur.fetchall()
+    return [
+        {
+            "Date": r[0],
+            "Vehicle": r[1],
+            "Code": r[2],
+            "Mileage": r[3],
+            "Fix / Service": r[4],
+            "Cost": r[5],
+            "Notes": r[6],
+        }
+        for r in rows
+    ]
+
+
+def _ledger_entries_to_csv(entries):
+    columns = ["Date", "Vehicle", "Code", "Mileage", "Fix / Service", "Cost", "Notes"]
+    lines = [",".join(columns)]
+    for e in entries:
+        row = [str(e.get(col, "") if e.get(col) is not None else "") for col in columns]
+        escaped = [v.replace('"', '""') for v in row]
+        lines.append(",".join(f'"{v}"' for v in escaped))
+    return "\n".join(lines)
+
+
 # ─── UPDATED SYSTEM PROMPT ──────────────────────
 SYSTEM_PROMPT = """
 You are an automotive diagnostic assistant. You will receive an OBD2 trouble code and a vehicle description (year, make, model). You must reply with exactly the following sections in clean Markdown. Do not add greetings, introductions, or any text outside these sections.
@@ -130,8 +236,8 @@ After the table, add two lines:
 **Urgency:** [🟢/🟡/🔴] – One clear sentence summarizing the overall urgency.
 **Pro Tip:** One helpful, specific money‑saving or diagnostic tip tailored to the code and vehicle.]
 
-Always tailor the parts list and cost estimates to the specific vehicle mentioned. If the vehicle is rare or unknown, base your answer on general data for that brand or engine type. 
-Never refuse to answer. Never include phrases like "I am not a mechanic" or "consult a professional" – the user already knows this. 
+Always tailor the parts list and cost estimates to the specific vehicle mentioned. If the vehicle is rare or unknown, base your answer on general data for that brand or engine type.
+Never refuse to answer. Never include phrases like "I am not a mechanic" or "consult a professional" – the user already knows this.
 Keep the tone calm, factual, and empowering.
 
 CRITICAL RULE: THE DIY DIFFICULTY RATING MANDATE
@@ -382,15 +488,15 @@ def generate_pdf_from_markdown(md_text, code, vehicle):
             <h1>OBD2 Diagnostic Report</h1>
             <small>Generated by Car Code Decoder</small>
         </div>
-        
+
         <div class="vehicle-info">
             <strong>Vehicle:</strong> {vehicle}<br>
             <strong>Diagnostic Trouble Code (DTC):</strong> {code}<br>
             <strong>Report Date:</strong> {datetime.now().strftime('%B %d, %Y at %I:%M %p')}
         </div>
-        
+
         {html_body}
-        
+
         <div class="footer">
             This report was generated automatically for informational purposes only.<br>
             Always verify repairs with a qualified, certified mechanic.<br>
@@ -400,7 +506,7 @@ def generate_pdf_from_markdown(md_text, code, vehicle):
     </body>
     </html>
     """
-    
+
     pdf_buffer = io.BytesIO()
     pisa_status = pisa.CreatePDF(
         io.StringIO(styled_html),
@@ -408,10 +514,10 @@ def generate_pdf_from_markdown(md_text, code, vehicle):
         encoding='UTF-8',
         show_error_as_pdf=True
     )
-    
+
     if pisa_status.err:
         raise Exception(f"PDF generation failed: {pisa_status.err}")
-    
+
     pdf_buffer.seek(0)
     return pdf_buffer.getvalue()
 
@@ -419,9 +525,9 @@ def generate_pdf_from_markdown(md_text, code, vehicle):
 def send_report_email(to_email, to_name, pdf_bytes, code, vehicle):
     if not SMTP_USER or not SMTP_PASS:
         raise Exception("Email is not configured. Please set SMTP_USER and SMTP_PASS in your .env file.")
-    
+
     subject = f"Your OBD2 Diagnostic Report - {code} for {vehicle}"
-    
+
     body = f"""
 Hello {to_name},
 
@@ -444,21 +550,21 @@ Keep this for your records!
 Best regards,
 The Car Code Decoder Team
 """
-    
+
     msg = MIMEMultipart()
     msg['From'] = f"{SMTP_FROM_NAME} <{SMTP_USER}>"
     msg['To'] = to_email
     msg['Subject'] = subject
     msg.attach(MIMEText(body, 'plain'))
-    
+
     attachment = MIMEApplication(pdf_bytes, _subtype='pdf')
     attachment.add_header(
-        'Content-Disposition', 
-        'attachment', 
+        'Content-Disposition',
+        'attachment',
         filename=f'Diagnostic_Report_{code}_{datetime.now().strftime("%Y%m%d_%H%M")}.pdf'
     )
     msg.attach(attachment)
-    
+
     try:
         with smtplib.SMTP(SMTP_HOST, SMTP_PORT) as server:
             server.starttls()
@@ -494,241 +600,375 @@ if not st.session_state.access_granted:
             st.error("That code isn't valid. Check your purchase confirmation email, or contact support.")
     st.stop()
 
-st.title("🔍 Decode Your Check Engine Light")
-st.markdown("Enter your OBD2 code and **either** your VIN (auto-decodes) **or** your Year/Make/Model.")
-
-# ─── INPUT FIELDS ────────────────────────────────
-
-# 1. OBD2 Code (Required)
-code = st.text_input(
-    "OBD2 Code *",
-    placeholder="e.g., P0420",
-    key="code_input_widget",
-    help="This is the 5-character alphanumeric code from your OBD2 scanner."
+# ─── NAVIGATION ───────────────────────────────────
+page = st.sidebar.radio(
+    "Navigate",
+    ["🔍 Decode a Code", "🗂️ Maintenance Ledger"],
+    key="nav_page",
 )
 
-# 2. VIN (Optional)
-vin = st.text_input(
-    "VIN (Optional - auto-decodes vehicle)",
-    placeholder="e.g., 1HGCM82633A123456 (17 characters)",
-    key="vin_input_widget",
-    help="Find it on your dashboard (through the windshield) or driver's door jamb."
-)
+# ═══════════════════════════════════════════════════
+# PAGE: DECODE A CODE
+# ═══════════════════════════════════════════════════
+if page == "🔍 Decode a Code":
+    st.title("🔍 Decode Your Check Engine Light")
+    st.markdown("Enter your OBD2 code and **either** your VIN (auto-decodes) **or** your Year/Make/Model.")
 
-# Separator
-st.markdown("**— OR —**")
+    # ─── INPUT FIELDS ────────────────────────────────
 
-# 3. Manual Vehicle Entry (Optional)
-st.caption("Enter your vehicle manually if you don't have the VIN handy.")
-
-col_year, col_make, col_model = st.columns(3)
-
-with col_year:
-    year = st.text_input(
-        "Year",
-        placeholder="e.g., 2015",
-        key="year_input_widget"
+    # 1. OBD2 Code (Required)
+    code = st.text_input(
+        "OBD2 Code *",
+        placeholder="e.g., P0420",
+        key="code_input_widget",
+        help="This is the 5-character alphanumeric code from your OBD2 scanner."
     )
 
-with col_make:
-    make = st.text_input(
-        "Make",
-        placeholder="e.g., Honda",
-        key="make_input_widget"
+    # 2. VIN (Optional)
+    vin = st.text_input(
+        "VIN (Optional - auto-decodes vehicle)",
+        placeholder="e.g., 1HGCM82633A123456 (17 characters)",
+        key="vin_input_widget",
+        help="Find it on your dashboard (through the windshield) or driver's door jamb."
     )
 
-with col_model:
-    model = st.text_input(
-        "Model",
-        placeholder="e.g., Civic",
-        key="model_input_widget"
-    )
+    # Separator
+    st.markdown("**— OR —**")
 
-# ─── BUTTONS ─────────────────────────────────────
-col1, col2 = st.columns(2)
+    # 3. Manual Vehicle Entry (Optional)
+    st.caption("Enter your vehicle manually if you don't have the VIN handy.")
 
-with col1:
-    if st.button("Get Answers", use_container_width=True, type="primary"):
-        # Read widget values
-        code_value = st.session_state.get("code_input_widget", "").strip()
-        vin_value = st.session_state.get("vin_input_widget", "").strip()
-        year_value = st.session_state.get("year_input_widget", "").strip()
-        make_value = st.session_state.get("make_input_widget", "").strip()
-        model_value = st.session_state.get("model_input_widget", "").strip()
-        
-        # --- Validation: Code ---
-        if not code_value:
-            st.error("Please enter an OBD2 code.")
-            st.stop()
-        
-        # --- Determine Vehicle ---
-        vehicle_for_prompt = ""
-        decoded_from_vin = False
-        
-        # PRIORITY 1: VIN (if provided)
-        if vin_value:
-            with st.spinner("🔍 Decoding VIN..."):
-                decoded = decode_vin(vin_value)
-            
-            if decoded:
-                vehicle_for_prompt = decoded["full"]
-                decoded_from_vin = True
-                # Queue the manual fields to be auto-filled on the next run
-                st.session_state.pending_vin_fields = {
-                    "year": decoded["year"],
-                    "make": decoded["make"],
-                    "model": decoded["model"],
-                }
-            else:
-                st.warning("⚠️ Could not decode that VIN. Please check it's exactly 17 characters. Falling back to manual entry.")
-        
-        # PRIORITY 2: Manual entry
-        if not vehicle_for_prompt:
-            if year_value and make_value and model_value:
-                vehicle_for_prompt = f"{year_value} {make_value} {model_value}"
-            else:
-                st.error("Please enter a valid VIN OR fill in the Year, Make, and Model.")
-                st.stop()
-        
-        # --- Show what we're using ---
-        if decoded_from_vin:
-            st.success(f"✅ VIN Decoded: **{vehicle_for_prompt}**")
-        else:
-            st.info(f"🚗 Vehicle: **{vehicle_for_prompt}**")
-        
-        # --- Rate limit: cap cost/abuse on the paid DeepSeek endpoint ---
-        if st.session_state.request_count >= MAX_REQUESTS_PER_SESSION:
-            st.error("You've reached the diagnosis limit for this session. Please refresh the page to start a new session.")
-            st.stop()
+    col_year, col_make, col_model = st.columns(3)
 
-        seconds_since_last = time.time() - st.session_state.last_request_time
-        if seconds_since_last < MIN_SECONDS_BETWEEN_REQUESTS:
-            wait = int(MIN_SECONDS_BETWEEN_REQUESTS - seconds_since_last) + 1
-            st.error(f"Please wait {wait} more second(s) before requesting another diagnosis.")
-            st.stop()
-
-        # Count this attempt now so rapid retries (including failed calls)
-        # are still throttled.
-        st.session_state.last_request_time = time.time()
-        st.session_state.request_count += 1
-
-        # --- Call the AI ---
-        with st.spinner("🧠 Decoding with AI..."):
-            try:
-                response = requests.post(
-                    DEEPSEEK_URL,
-                    headers={
-                        "Authorization": f"Bearer {DEEPSEEK_API_KEY}",
-                        "Content-Type": "application/json",
-                    },
-                    json={
-                        "model": "deepseek-chat",
-                        "messages": [
-                            {"role": "system", "content": SYSTEM_PROMPT},
-                            {"role": "user", "content": f"Code: {code_value}\nVehicle: {vehicle_for_prompt}"}
-                        ],
-                        "temperature": 0.2,
-                        "max_tokens": 1800,
-                    },
-                    timeout=30,
-                )
-                data = response.json()
-                if "error" in data:
-                    st.error(f"API error: {data['error']['message']}")
-                else:
-                    reply = data["choices"][0]["message"]["content"]
-                    reply = add_cost_disclaimer(reply)
-                    st.session_state.output_text = reply
-                    st.session_state.last_code = code_value
-                    st.session_state.last_vehicle = vehicle_for_prompt
-                    # Clear any leftover PDF/email state from a prior report
-                    st.session_state.pop("email_sent_message", None)
-                    st.session_state.pop("last_pdf_bytes", None)
-                    st.session_state.pop("last_pdf_filename", None)
-                    st.rerun()
-            except Exception as e:
-                st.error(f"Something went wrong: {e}")
-
-with col2:
-    if st.button("🔄 New Diagnosis", use_container_width=True, type="secondary"):
-        st.session_state.pop("code_input_widget", None)
-        st.session_state.pop("vin_input_widget", None)
-        st.session_state.pop("year_input_widget", None)
-        st.session_state.pop("make_input_widget", None)
-        st.session_state.pop("model_input_widget", None)
-        st.session_state.output_text = None
-        st.session_state.pop("email_sent_message", None)
-        st.session_state.pop("last_pdf_bytes", None)
-        st.session_state.pop("last_pdf_filename", None)
-        st.rerun()
-
-# ─── DISPLAY OUTPUT ──────────────────────────────
-if st.session_state.output_text:
-    st.markdown("---")
-    st.markdown(st.session_state.output_text)
-    
-    # ─── EMAIL REPORT SECTION ──────────────────────
-    st.markdown("---")
-    st.subheader("📧 Email This Report")
-    st.caption("Get a clean PDF copy of this diagnosis sent straight to your inbox.")
-    
-    with st.form("email_form"):
-        col_a, col_b = st.columns(2)
-        with col_a:
-            user_name = st.text_input("Your Name", placeholder="e.g., Joe Smith", key="user_name")
-        with col_b:
-            user_email = st.text_input("Your Email", placeholder="e.g., joe@email.com", key="user_email")
-        
-        send_button = st.form_submit_button("📧 Send Report", use_container_width=True, type="primary")
-        
-        if send_button:
-            # Strip control/newline characters so nothing can be smuggled
-            # into the SMTP headers, and trim stray whitespace.
-            user_name_clean = re.sub(r"[\r\n\x00-\x1f]", " ", user_name or "").strip()
-            user_email_clean = re.sub(r"[\r\n\x00-\x1f]", "", user_email or "").strip()
-
-            if not user_name_clean or not user_email_clean:
-                st.error("Please enter both your name and email.")
-            elif not EMAIL_RE.match(user_email_clean):
-                st.error("Please enter a valid email address.")
-            else:
-                try:
-                    with st.spinner("📄 Generating your PDF report..."):
-                        md_text = st.session_state.output_text
-                        code_val = st.session_state.get("last_code", "Unknown")
-                        vehicle_val = st.session_state.get("last_vehicle", "Unknown")
-                        pdf_bytes = generate_pdf_from_markdown(md_text, code_val, vehicle_val)
-
-                    with st.spinner("📧 Sending your email..."):
-                        send_report_email(user_email_clean, user_name_clean, pdf_bytes, code_val, vehicle_val)
-
-                    # st.download_button can't live inside st.form, so stash
-                    # the result in session_state and render it below, outside
-                    # the form.
-                    st.session_state.email_sent_message = (
-                        f"✅ Report sent successfully to {user_email_clean}! "
-                        "Check your inbox (and spam folder)."
-                    )
-                    st.session_state.last_pdf_bytes = pdf_bytes
-                    st.session_state.last_pdf_filename = (
-                        f"Diagnostic_Report_{code_val}_{datetime.now().strftime('%Y%m%d')}.pdf"
-                    )
-
-                except Exception as e:
-                    st.error(f"❌ Failed to send: {str(e)}")
-                    st.info("💡 Make sure your SMTP settings are correct in the .env file.")
-
-    if st.session_state.get("email_sent_message"):
-        st.success(st.session_state.email_sent_message)
-        st.download_button(
-            label="⬇️ Download PDF (backup)",
-            data=st.session_state.last_pdf_bytes,
-            file_name=st.session_state.last_pdf_filename,
-            mime="application/pdf",
-            key="download_pdf_backup",
+    with col_year:
+        year = st.text_input(
+            "Year",
+            placeholder="e.g., 2015",
+            key="year_input_widget"
         )
 
-# ─── FOOTER ──────────────────────────────────────
-st.markdown("---")
-st.caption("💡 **Tip:** Click '🔄 New Diagnosis' to clear the screen and start over with a new code.")
-st.caption("⚠️ This clears the **app screen only**. It does NOT clear the Check Engine Light from your car's computer.")
+    with col_make:
+        make = st.text_input(
+            "Make",
+            placeholder="e.g., Honda",
+            key="make_input_widget"
+        )
+
+    with col_model:
+        model = st.text_input(
+            "Model",
+            placeholder="e.g., Civic",
+            key="model_input_widget"
+        )
+
+    # ─── BUTTONS ─────────────────────────────────────
+    col1, col2 = st.columns(2)
+
+    with col1:
+        if st.button("Get Answers", use_container_width=True, type="primary"):
+            # Read widget values
+            code_value = st.session_state.get("code_input_widget", "").strip()
+            vin_value = st.session_state.get("vin_input_widget", "").strip()
+            year_value = st.session_state.get("year_input_widget", "").strip()
+            make_value = st.session_state.get("make_input_widget", "").strip()
+            model_value = st.session_state.get("model_input_widget", "").strip()
+
+            # --- Validation: Code ---
+            if not code_value:
+                st.error("Please enter an OBD2 code.")
+                st.stop()
+
+            # --- Determine Vehicle ---
+            vehicle_for_prompt = ""
+            decoded_from_vin = False
+
+            # PRIORITY 1: VIN (if provided)
+            if vin_value:
+                with st.spinner("🔍 Decoding VIN..."):
+                    decoded = decode_vin(vin_value)
+
+                if decoded:
+                    vehicle_for_prompt = decoded["full"]
+                    decoded_from_vin = True
+                    # Queue the manual fields to be auto-filled on the next run
+                    st.session_state.pending_vin_fields = {
+                        "year": decoded["year"],
+                        "make": decoded["make"],
+                        "model": decoded["model"],
+                    }
+                else:
+                    st.warning("⚠️ Could not decode that VIN. Please check it's exactly 17 characters. Falling back to manual entry.")
+
+            # PRIORITY 2: Manual entry
+            if not vehicle_for_prompt:
+                if year_value and make_value and model_value:
+                    vehicle_for_prompt = f"{year_value} {make_value} {model_value}"
+                else:
+                    st.error("Please enter a valid VIN OR fill in the Year, Make, and Model.")
+                    st.stop()
+
+            # --- Show what we're using ---
+            if decoded_from_vin:
+                st.success(f"✅ VIN Decoded: **{vehicle_for_prompt}**")
+            else:
+                st.info(f"🚗 Vehicle: **{vehicle_for_prompt}**")
+
+            # --- Rate limit: cap cost/abuse on the paid DeepSeek endpoint ---
+            if st.session_state.request_count >= MAX_REQUESTS_PER_SESSION:
+                st.error("You've reached the diagnosis limit for this session. Please refresh the page to start a new session.")
+                st.stop()
+
+            seconds_since_last = time.time() - st.session_state.last_request_time
+            if seconds_since_last < MIN_SECONDS_BETWEEN_REQUESTS:
+                wait = int(MIN_SECONDS_BETWEEN_REQUESTS - seconds_since_last) + 1
+                st.error(f"Please wait {wait} more second(s) before requesting another diagnosis.")
+                st.stop()
+
+            # Count this attempt now so rapid retries (including failed calls)
+            # are still throttled.
+            st.session_state.last_request_time = time.time()
+            st.session_state.request_count += 1
+
+            # --- Call the AI ---
+            with st.spinner("🧠 Decoding with AI..."):
+                try:
+                    response = requests.post(
+                        DEEPSEEK_URL,
+                        headers={
+                            "Authorization": f"Bearer {DEEPSEEK_API_KEY}",
+                            "Content-Type": "application/json",
+                        },
+                        json={
+                            "model": "deepseek-chat",
+                            "messages": [
+                                {"role": "system", "content": SYSTEM_PROMPT},
+                                {"role": "user", "content": f"Code: {code_value}\nVehicle: {vehicle_for_prompt}"}
+                            ],
+                            "temperature": 0.2,
+                            "max_tokens": 1800,
+                        },
+                        timeout=30,
+                    )
+                    data = response.json()
+                    if "error" in data:
+                        st.error(f"API error: {data['error']['message']}")
+                    else:
+                        reply = data["choices"][0]["message"]["content"]
+                        reply = add_cost_disclaimer(reply)
+                        st.session_state.output_text = reply
+                        st.session_state.last_code = code_value
+                        st.session_state.last_vehicle = vehicle_for_prompt
+                        # Clear any leftover PDF/email state from a prior report
+                        st.session_state.pop("email_sent_message", None)
+                        st.session_state.pop("last_pdf_bytes", None)
+                        st.session_state.pop("last_pdf_filename", None)
+                        st.rerun()
+                except Exception as e:
+                    st.error(f"Something went wrong: {e}")
+
+    with col2:
+        if st.button("🔄 New Diagnosis", use_container_width=True, type="secondary"):
+            st.session_state.pop("code_input_widget", None)
+            st.session_state.pop("vin_input_widget", None)
+            st.session_state.pop("year_input_widget", None)
+            st.session_state.pop("make_input_widget", None)
+            st.session_state.pop("model_input_widget", None)
+            st.session_state.output_text = None
+            st.session_state.pop("email_sent_message", None)
+            st.session_state.pop("last_pdf_bytes", None)
+            st.session_state.pop("last_pdf_filename", None)
+            st.rerun()
+
+    # ─── DISPLAY OUTPUT ──────────────────────────────
+    if st.session_state.output_text:
+        st.markdown("---")
+        st.markdown(st.session_state.output_text)
+
+        # ─── EMAIL REPORT SECTION ──────────────────────
+        st.markdown("---")
+        st.subheader("📧 Email This Report")
+        st.caption("Get a clean PDF copy of this diagnosis sent straight to your inbox.")
+
+        with st.form("email_form"):
+            col_a, col_b = st.columns(2)
+            with col_a:
+                user_name = st.text_input("Your Name", placeholder="e.g., Joe Smith", key="user_name")
+            with col_b:
+                user_email = st.text_input("Your Email", placeholder="e.g., joe@email.com", key="user_email")
+
+            send_button = st.form_submit_button("📧 Send Report", use_container_width=True, type="primary")
+
+            if send_button:
+                # Strip control/newline characters so nothing can be smuggled
+                # into the SMTP headers, and trim stray whitespace.
+                user_name_clean = re.sub(r"[\r\n\x00-\x1f]", " ", user_name or "").strip()
+                user_email_clean = re.sub(r"[\r\n\x00-\x1f]", "", user_email or "").strip()
+
+                if not user_name_clean or not user_email_clean:
+                    st.error("Please enter both your name and email.")
+                elif not EMAIL_RE.match(user_email_clean):
+                    st.error("Please enter a valid email address.")
+                else:
+                    try:
+                        with st.spinner("📄 Generating your PDF report..."):
+                            md_text = st.session_state.output_text
+                            code_val = st.session_state.get("last_code", "Unknown")
+                            vehicle_val = st.session_state.get("last_vehicle", "Unknown")
+                            pdf_bytes = generate_pdf_from_markdown(md_text, code_val, vehicle_val)
+
+                        with st.spinner("📧 Sending your email..."):
+                            send_report_email(user_email_clean, user_name_clean, pdf_bytes, code_val, vehicle_val)
+
+                        # st.download_button can't live inside st.form, so stash
+                        # the result in session_state and render it below, outside
+                        # the form.
+                        st.session_state.email_sent_message = (
+                            f"✅ Report sent successfully to {user_email_clean}! "
+                            "Check your inbox (and spam folder)."
+                        )
+                        st.session_state.last_pdf_bytes = pdf_bytes
+                        st.session_state.last_pdf_filename = (
+                            f"Diagnostic_Report_{code_val}_{datetime.now().strftime('%Y%m%d')}.pdf"
+                        )
+
+                    except Exception as e:
+                        st.error(f"❌ Failed to send: {str(e)}")
+                        st.info("💡 Make sure your SMTP settings are correct in the .env file.")
+
+        if st.session_state.get("email_sent_message"):
+            st.success(st.session_state.email_sent_message)
+            st.download_button(
+                label="⬇️ Download PDF (backup)",
+                data=st.session_state.last_pdf_bytes,
+                file_name=st.session_state.last_pdf_filename,
+                mime="application/pdf",
+                key="download_pdf_backup",
+            )
+
+        # ─── QUICK SAVE TO MAINTENANCE LEDGER ──────────
+        st.markdown("---")
+        with st.expander("📒 Save This Fix to Your Maintenance Ledger"):
+            st.caption("Already fixed it (or about to)? Log it here so you've got a record next time something comes up.")
+            with st.form("quick_ledger_form"):
+                q_email = st.text_input("Your Email *", placeholder="e.g., joe@email.com", key="quick_ledger_email")
+                q_date = st.date_input("Service Date", value=datetime.now(), key="quick_ledger_date")
+                q_mileage = st.number_input("Mileage", min_value=0, step=1, key="quick_ledger_mileage")
+                q_fix = st.text_input(
+                    "What was fixed / replaced *",
+                    placeholder="e.g., Replaced O2 sensor bank 1",
+                    key="quick_ledger_fix",
+                )
+                q_cost = st.number_input("Cost ($)", min_value=0.0, step=1.0, key="quick_ledger_cost")
+                q_notes = st.text_area("Notes (optional)", key="quick_ledger_notes")
+                q_submit = st.form_submit_button("💾 Save to Ledger", type="primary", use_container_width=True)
+
+                if q_submit:
+                    q_email_clean = re.sub(r"[\r\n\x00-\x1f]", "", q_email or "").strip()
+                    q_fix_clean = (q_fix or "").strip()
+                    if not q_email_clean or not EMAIL_RE.match(q_email_clean):
+                        st.error("Please enter a valid email address.")
+                    elif not q_fix_clean:
+                        st.error("Please describe what was fixed.")
+                    else:
+                        add_ledger_entry(
+                            email=q_email_clean,
+                            vehicle=st.session_state.get("last_vehicle", ""),
+                            code=st.session_state.get("last_code", ""),
+                            service_date=q_date.strftime("%Y-%m-%d"),
+                            mileage=q_mileage,
+                            fix_performed=q_fix_clean,
+                            cost=q_cost,
+                            notes=q_notes,
+                        )
+                        st.success("✅ Saved! Check the 🗂️ Maintenance Ledger tab anytime to view your history.")
+
+    # ─── FOOTER ──────────────────────────────────────
+    st.markdown("---")
+    st.caption("💡 **Tip:** Click '🔄 New Diagnosis' to clear the screen and start over with a new code.")
+    st.caption("⚠️ This clears the **app screen only**. It does NOT clear the Check Engine Light from your car's computer.")
+
+# ═══════════════════════════════════════════════════
+# PAGE: MAINTENANCE LEDGER
+# ═══════════════════════════════════════════════════
+elif page == "🗂️ Maintenance Ledger":
+    st.title("🗂️ Your Maintenance Ledger")
+    st.markdown(
+        "Keep a running record of every fix and service on your vehicle, "
+        "tied to your email so you can pull it up anytime — on any device."
+    )
+
+    st.subheader("Look Up Your Records")
+    lookup_email = st.text_input("Your Email", placeholder="e.g., joe@email.com", key="ledger_lookup_email")
+    if st.button("View My Ledger", type="primary"):
+        lookup_clean = re.sub(r"[\r\n\x00-\x1f]", "", lookup_email or "").strip()
+        if not lookup_clean or not EMAIL_RE.match(lookup_clean):
+            st.error("Enter a valid email address to look up your records.")
+        else:
+            st.session_state.ledger_entries = get_ledger_entries(lookup_clean)
+            st.session_state.ledger_last_lookup = lookup_clean
+
+    if st.session_state.ledger_entries is not None:
+        entries = st.session_state.ledger_entries
+        if entries:
+            st.success(f"Found {len(entries)} record(s) for {st.session_state.ledger_last_lookup}.")
+            st.dataframe(entries, use_container_width=True, hide_index=True)
+            st.download_button(
+                "⬇️ Download as CSV",
+                data=_ledger_entries_to_csv(entries),
+                file_name=f"maintenance_ledger_{st.session_state.ledger_last_lookup}.csv",
+                mime="text/csv",
+            )
+        else:
+            st.info("No records found for that email yet. Add your first entry below.")
+
+    st.markdown("---")
+    st.subheader("➕ Add an Entry")
+    st.caption("Log any fix, part replacement, or routine service — not just codes decoded here.")
+    with st.form("ledger_add_form"):
+        col_e, col_d = st.columns(2)
+        with col_e:
+            entry_email = st.text_input("Your Email *", placeholder="e.g., joe@email.com", key="ledger_entry_email")
+        with col_d:
+            entry_date = st.date_input("Service Date *", value=datetime.now(), key="ledger_entry_date")
+
+        col_v, col_c = st.columns(2)
+        with col_v:
+            entry_vehicle = st.text_input("Vehicle", placeholder="e.g., 2015 Honda Civic", key="ledger_entry_vehicle")
+        with col_c:
+            entry_code = st.text_input("OBD2 Code (if any)", placeholder="e.g., P0420", key="ledger_entry_code")
+
+        col_m, col_cost = st.columns(2)
+        with col_m:
+            entry_mileage = st.number_input("Mileage", min_value=0, step=1, key="ledger_entry_mileage")
+        with col_cost:
+            entry_cost = st.number_input("Cost ($)", min_value=0.0, step=1.0, key="ledger_entry_cost")
+
+        entry_fix = st.text_input(
+            "What was fixed / replaced *",
+            placeholder="e.g., Replaced O2 sensor bank 1",
+            key="ledger_entry_fix",
+        )
+        entry_notes = st.text_area("Notes (optional)", placeholder="Anything else worth remembering", key="ledger_entry_notes")
+
+        submitted = st.form_submit_button("💾 Save to Ledger", type="primary", use_container_width=True)
+        if submitted:
+            email_clean = re.sub(r"[\r\n\x00-\x1f]", "", entry_email or "").strip()
+            fix_clean = (entry_fix or "").strip()
+            if not email_clean or not EMAIL_RE.match(email_clean):
+                st.error("Please enter a valid email address.")
+            elif not fix_clean:
+                st.error("Please describe what was fixed or serviced.")
+            else:
+                add_ledger_entry(
+                    email=email_clean,
+                    vehicle=entry_vehicle,
+                    code=entry_code,
+                    service_date=entry_date.strftime("%Y-%m-%d"),
+                    mileage=entry_mileage,
+                    fix_performed=fix_clean,
+                    cost=entry_cost,
+                    notes=entry_notes,
+                )
+                st.success("✅ Saved to your maintenance ledger!")
+                st.session_state.ledger_entries = get_ledger_entries(email_clean)
+                st.session_state.ledger_last_lookup = email_clean
