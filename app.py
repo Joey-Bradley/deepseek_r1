@@ -603,7 +603,7 @@ if not st.session_state.access_granted:
 # ─── NAVIGATION ───────────────────────────────────
 page = st.sidebar.radio(
     "Navigate",
-    ["🔍 Decode a Code", "🗂️ Maintenance Ledger"],
+    ["🔍 Decode a Code", "🗂️ Maintenance History Log"],
     key="nav_page",
 )
 
@@ -847,7 +847,7 @@ if page == "🔍 Decode a Code":
 
         # ─── QUICK SAVE TO MAINTENANCE LEDGER ──────────
         st.markdown("---")
-        with st.expander("📒 Save This Fix to Your Maintenance Ledger"):
+        with st.expander("📒 Save This Fix to Your Maintenance History Log"):
             st.caption("Already fixed it (or about to)? Log it here so you've got a record next time something comes up.")
             with st.form("quick_ledger_form"):
                 q_email = st.text_input("Your Email *", placeholder="e.g., joe@email.com", key="quick_ledger_email")
@@ -860,7 +860,7 @@ if page == "🔍 Decode a Code":
                 )
                 q_cost = st.number_input("Cost ($)", min_value=0.0, step=1.0, key="quick_ledger_cost")
                 q_notes = st.text_area("Notes (optional)", key="quick_ledger_notes")
-                q_submit = st.form_submit_button("💾 Save to Ledger", type="primary", use_container_width=True)
+                q_submit = st.form_submit_button("💾 Save to History Log", type="primary", use_container_width=True)
 
                 if q_submit:
                     q_email_clean = re.sub(r"[\r\n\x00-\x1f]", "", q_email or "").strip()
@@ -880,7 +880,7 @@ if page == "🔍 Decode a Code":
                             cost=q_cost,
                             notes=q_notes,
                         )
-                        st.success("✅ Saved! Check the 🗂️ Maintenance Ledger tab anytime to view your history.")
+                        st.success("✅ Saved! Check the 🗂️ Maintenance History Log tab anytime to view your history.")
 
     # ─── FOOTER ──────────────────────────────────────
     st.markdown("---")
@@ -888,10 +888,10 @@ if page == "🔍 Decode a Code":
     st.caption("⚠️ This clears the **app screen only**. It does NOT clear the Check Engine Light from your car's computer.")
 
 # ═══════════════════════════════════════════════════
-# PAGE: MAINTENANCE LEDGER
+# PAGE: MAINTENANCE HISTORY LOG
 # ═══════════════════════════════════════════════════
-elif page == "🗂️ Maintenance Ledger":
-    st.title("🗂️ Your Maintenance Ledger")
+elif page == "🗂️ Maintenance History Log":
+    st.title("🗂️ Your Maintenance History Log")
     st.markdown(
         "Keep a running record of every fix and service on your vehicle, "
         "tied to your email so you can pull it up anytime — on any device."
@@ -899,7 +899,7 @@ elif page == "🗂️ Maintenance Ledger":
 
     st.subheader("Look Up Your Records")
     lookup_email = st.text_input("Your Email", placeholder="e.g., joe@email.com", key="ledger_lookup_email")
-    if st.button("View My Ledger", type="primary"):
+    if st.button("View My History Log", type="primary"):
         lookup_clean = re.sub(r"[\r\n\x00-\x1f]", "", lookup_email or "").strip()
         if not lookup_clean or not EMAIL_RE.match(lookup_clean):
             st.error("Enter a valid email address to look up your records.")
@@ -915,7 +915,7 @@ elif page == "🗂️ Maintenance Ledger":
             st.download_button(
                 "⬇️ Download as CSV",
                 data=_ledger_entries_to_csv(entries),
-                file_name=f"maintenance_ledger_{st.session_state.ledger_last_lookup}.csv",
+                file_name=f"maintenance_history_log_{st.session_state.ledger_last_lookup}.csv",
                 mime="text/csv",
             )
         else:
@@ -950,7 +950,7 @@ elif page == "🗂️ Maintenance Ledger":
         )
         entry_notes = st.text_area("Notes (optional)", placeholder="Anything else worth remembering", key="ledger_entry_notes")
 
-        submitted = st.form_submit_button("💾 Save to Ledger", type="primary", use_container_width=True)
+        submitted = st.form_submit_button("💾 Save to History Log", type="primary", use_container_width=True)
         if submitted:
             email_clean = re.sub(r"[\r\n\x00-\x1f]", "", entry_email or "").strip()
             fix_clean = (entry_fix or "").strip()
