@@ -845,43 +845,6 @@ if page == "🔍 Decode a Code":
                 key="download_pdf_backup",
             )
 
-        # ─── QUICK SAVE TO MAINTENANCE LEDGER ──────────
-        st.markdown("---")
-        with st.expander("📒 Save This Fix to Your Maintenance History Log"):
-            st.caption("Already fixed it (or about to)? Log it here so you've got a record next time something comes up.")
-            with st.form("quick_ledger_form"):
-                q_email = st.text_input("Your Email *", placeholder="e.g., joe@email.com", key="quick_ledger_email")
-                q_date = st.date_input("Service Date", value=datetime.now(), key="quick_ledger_date")
-                q_mileage = st.number_input("Mileage", min_value=0, step=1, key="quick_ledger_mileage")
-                q_fix = st.text_input(
-                    "What was fixed / replaced *",
-                    placeholder="e.g., Replaced O2 sensor bank 1",
-                    key="quick_ledger_fix",
-                )
-                q_cost = st.number_input("Cost ($)", min_value=0.0, step=1.0, key="quick_ledger_cost")
-                q_notes = st.text_area("Notes (optional)", key="quick_ledger_notes")
-                q_submit = st.form_submit_button("💾 Save to History Log", type="primary", use_container_width=True)
-
-                if q_submit:
-                    q_email_clean = re.sub(r"[\r\n\x00-\x1f]", "", q_email or "").strip()
-                    q_fix_clean = (q_fix or "").strip()
-                    if not q_email_clean or not EMAIL_RE.match(q_email_clean):
-                        st.error("Please enter a valid email address.")
-                    elif not q_fix_clean:
-                        st.error("Please describe what was fixed.")
-                    else:
-                        add_ledger_entry(
-                            email=q_email_clean,
-                            vehicle=st.session_state.get("last_vehicle", ""),
-                            code=st.session_state.get("last_code", ""),
-                            service_date=q_date.strftime("%Y-%m-%d"),
-                            mileage=q_mileage,
-                            fix_performed=q_fix_clean,
-                            cost=q_cost,
-                            notes=q_notes,
-                        )
-                        st.success("✅ Saved! Check the 🗂️ Maintenance History Log tab anytime to view your history.")
-
     # ─── FOOTER ──────────────────────────────────────
     st.markdown("---")
     st.caption("💡 **Tip:** Click '🔄 New Diagnosis' to clear the screen and start over with a new code.")
@@ -891,84 +854,8 @@ if page == "🔍 Decode a Code":
 # PAGE: MAINTENANCE HISTORY LOG
 # ═══════════════════════════════════════════════════
 elif page == "🗂️ Maintenance History Log":
-    st.title("🗂️ Your Maintenance History Log")
-    st.markdown(
-        "Keep a running record of every fix and service on your vehicle, "
-        "tied to your email so you can pull it up anytime — on any device."
+    st.title("🗂️ Maintenance History Log")
+    st.info(
+        "This feature has moved to a dedicated Maintenance Log app that's easier to use "
+        "on your phone. We'll post the link here as soon as it's live — thanks for your patience!"
     )
-
-    st.subheader("Look Up Your Records")
-    lookup_email = st.text_input("Your Email", placeholder="e.g., joe@email.com", key="ledger_lookup_email")
-    if st.button("View My History Log", type="primary"):
-        lookup_clean = re.sub(r"[\r\n\x00-\x1f]", "", lookup_email or "").strip()
-        if not lookup_clean or not EMAIL_RE.match(lookup_clean):
-            st.error("Enter a valid email address to look up your records.")
-        else:
-            st.session_state.ledger_entries = get_ledger_entries(lookup_clean)
-            st.session_state.ledger_last_lookup = lookup_clean
-
-    if st.session_state.ledger_entries is not None:
-        entries = st.session_state.ledger_entries
-        if entries:
-            st.success(f"Found {len(entries)} record(s) for {st.session_state.ledger_last_lookup}.")
-            st.dataframe(entries, use_container_width=True, hide_index=True)
-            st.download_button(
-                "⬇️ Download as CSV",
-                data=_ledger_entries_to_csv(entries),
-                file_name=f"maintenance_history_log_{st.session_state.ledger_last_lookup}.csv",
-                mime="text/csv",
-            )
-        else:
-            st.info("No records found for that email yet. Add your first entry below.")
-
-    st.markdown("---")
-    st.subheader("➕ Add an Entry")
-    st.caption("Log any fix, part replacement, or routine service — not just codes decoded here.")
-    with st.form("ledger_add_form"):
-        col_e, col_d = st.columns(2)
-        with col_e:
-            entry_email = st.text_input("Your Email *", placeholder="e.g., joe@email.com", key="ledger_entry_email")
-        with col_d:
-            entry_date = st.date_input("Service Date *", value=datetime.now(), key="ledger_entry_date")
-
-        col_v, col_c = st.columns(2)
-        with col_v:
-            entry_vehicle = st.text_input("Vehicle", placeholder="e.g., 2015 Honda Civic", key="ledger_entry_vehicle")
-        with col_c:
-            entry_code = st.text_input("OBD2 Code (if any)", placeholder="e.g., P0420", key="ledger_entry_code")
-
-        col_m, col_cost = st.columns(2)
-        with col_m:
-            entry_mileage = st.number_input("Mileage", min_value=0, step=1, key="ledger_entry_mileage")
-        with col_cost:
-            entry_cost = st.number_input("Cost ($)", min_value=0.0, step=1.0, key="ledger_entry_cost")
-
-        entry_fix = st.text_input(
-            "What was fixed / replaced *",
-            placeholder="e.g., Replaced O2 sensor bank 1",
-            key="ledger_entry_fix",
-        )
-        entry_notes = st.text_area("Notes (optional)", placeholder="Anything else worth remembering", key="ledger_entry_notes")
-
-        submitted = st.form_submit_button("💾 Save to History Log", type="primary", use_container_width=True)
-        if submitted:
-            email_clean = re.sub(r"[\r\n\x00-\x1f]", "", entry_email or "").strip()
-            fix_clean = (entry_fix or "").strip()
-            if not email_clean or not EMAIL_RE.match(email_clean):
-                st.error("Please enter a valid email address.")
-            elif not fix_clean:
-                st.error("Please describe what was fixed or serviced.")
-            else:
-                add_ledger_entry(
-                    email=email_clean,
-                    vehicle=entry_vehicle,
-                    code=entry_code,
-                    service_date=entry_date.strftime("%Y-%m-%d"),
-                    mileage=entry_mileage,
-                    fix_performed=fix_clean,
-                    cost=entry_cost,
-                    notes=entry_notes,
-                )
-                st.success("✅ Saved to your maintenance ledger!")
-                st.session_state.ledger_entries = get_ledger_entries(email_clean)
-                st.session_state.ledger_last_lookup = email_clean
